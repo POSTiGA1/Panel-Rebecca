@@ -24,7 +24,6 @@ import {
 	PopoverTrigger,
 	Progress,
 	SimpleGrid,
-	Spinner,
 	Stack,
 	Tag,
 	Text,
@@ -54,7 +53,7 @@ import type { SortingState } from "@tanstack/react-table";
 import { AppleEmojiText } from "components/common/AppleEmojiText";
 import { PanelSelect as Select } from "components/common/PanelSelect";
 import { SearchInput } from "components/common/SearchInput";
-import { fetchInbounds, useDashboard } from "contexts/DashboardContext";
+import { useDashboard } from "contexts/DashboardContext";
 import {
 	FetchNodesQueryKey,
 	type NodeType,
@@ -86,14 +85,20 @@ import {
 } from "utils/toastHandler";
 import {
 	DataTable,
+	PageLoadingSkeleton,
 	type DataTableColumn,
 	type DataTableRowAction,
 } from "../components/ui";
 import { CoreVersionDialog } from "../components/CoreVersionDialog";
+import type { BuildCatalog } from "../components/BuildVersionSelect";
 import { ConfirmDialog } from "../components/dialogs/ConfirmDialog";
 import { GeoUpdateDialog } from "../components/GeoUpdateDialog";
 import { NodeFormModal } from "../components/NodeFormModal";
 import { NodeModalStatusBadge } from "../components/NodeModalStatusBadge";
+import {
+	NodeServiceUpdateDialog,
+	type NodeServiceUpdateChannel,
+} from "../components/NodeServiceUpdateDialog";
 
 const normalizeVersion = (value?: string | null) => {
 	if (!value) return "";
@@ -148,9 +153,6 @@ const formatCellValue = (value?: string | number | null): string => {
 	}
 	return String(value);
 };
-
-const uniqueValues = (items: string[]): string[] =>
-	Array.from(new Set(items.filter(Boolean)));
 
 const getNodeServiceUpdateAvailable = (
 	currentVersion?: string | null,
@@ -252,15 +254,26 @@ const ProtocolStatusList = ({
 				</Tag>
 			))
 		) : (
-			<Text fontSize="sm" color="panel.textMuted">-</Text>
+			<Text fontSize="sm" color="panel.textMuted">
+				-
+			</Text>
 		)}
 	</Flex>
 );
 
 const NodeDetail = ({ label, value }: { label: string; value: string }) => (
 	<Box minW={0}>
-		<Text fontSize="xs" color="panel.textMuted" mb={1}>{label}</Text>
-		<Text fontSize="sm" color="panel.text" fontWeight="medium" overflowWrap="anywhere">{value}</Text>
+		<Text fontSize="xs" color="panel.textMuted" mb={1}>
+			{label}
+		</Text>
+		<Text
+			fontSize="sm"
+			color="panel.text"
+			fontWeight="medium"
+			overflowWrap="anywhere"
+		>
+			{value}
+		</Text>
 	</Box>
 );
 
@@ -518,6 +531,10 @@ type GeoDialogTarget =
 	| { type: "node"; node: NodeType }
 	| { type: "bulk"; nodes?: NodeType[] };
 
+type ServiceUpdateTarget =
+	| { type: "node"; node: NodeType }
+	| { type: "bulk"; nodes: NodeType[] };
+
 type ServiceActionConfirm =
 	| { type: "restart"; node: NodeType; label: string }
 	| { type: "update"; node: NodeType; label: string }
@@ -586,7 +603,6 @@ export const NodesPage: FC = () => {
 	const { userData, getUserIsSuccess } = useGetUser();
 	const canManageNodes =
 		getUserIsSuccess && Boolean(userData.permissions?.sections.nodes);
-	const inbounds = useDashboard((state) => state.inbounds);
 	const onEditingNodes = useDashboard((state) => state.onEditingNodes);
 	const {
 		data: nodes,
@@ -626,6 +642,8 @@ export const NodesPage: FC = () => {
 	const [pageSize, setPageSize] = useState(() => getNodesPerPageLimitSize());
 	const [versionDialogTarget, setVersionDialogTarget] =
 		useState<VersionDialogTarget | null>(null);
+	const [serviceUpdateTarget, setServiceUpdateTarget] =
+		useState<ServiceUpdateTarget | null>(null);
 	const [geoDialogTarget, setGeoDialogTarget] =
 		useState<GeoDialogTarget | null>(null);
 	const [updatingCoreNodeId, setUpdatingCoreNodeId] = useState<number | null>(
@@ -698,6 +716,16 @@ export const NodesPage: FC = () => {
 			enabled: canManageNodes,
 		},
 	);
+	const { data: buildCatalog } = useQuery<BuildCatalog>(
+		["maintenance-builds", "node"],
+		() => apiFetch<BuildCatalog>("/maintenance/builds?target=node"),
+		{
+			enabled: canManageNodes,
+			refetchOnWindowFocus: false,
+			staleTime: 10 * 60 * 1000,
+			retry: false,
+		},
+	);
 	const detectedNodeUpdateChannel =
 		nodes?.find((nodeItem) => nodeItem.node_update_channel)
 			?.node_update_channel || maintenanceInfo?.node_update?.channel;
@@ -708,16 +736,6 @@ export const NodesPage: FC = () => {
 		maintenanceInfo?.panel?.install_mode ||
 		"docker";
 	const hostActionsAvailable = panelInstallMode === "binary";
-	const defaultInboundSummaries = useMemo(
-		() =>
-			uniqueValues(
-				Array.from(inbounds.values()).flatMap((items) =>
-					items.map((inbound) => inbound.tag),
-				),
-			),
-		[inbounds],
-	);
-
 	useEffect(() => {
 		if (!canManageNodes) {
 			onEditingNodes(false);
@@ -729,12 +747,6 @@ export const NodesPage: FC = () => {
 			onEditingNodes(false);
 		};
 	}, [canManageNodes, onEditingNodes]);
-
-	useEffect(() => {
-		if (canManageNodes && !inbounds.size) {
-			fetchInbounds();
-		}
-	}, [canManageNodes, inbounds.size]);
 
 	const { isLoading: isAdding, mutate: addNodeMutate } = useMutation(addNode, {
 		onSuccess: (createdNode: NodeType) => {
@@ -1045,14 +1057,67 @@ export const NodesPage: FC = () => {
 		setServiceActionConfirm({ type: "restart", node, label });
 	};
 
-	const handleUpdateNodeService = useCallback(
-		(node: NodeType) => {
-			if (!node?.id) return;
-			const label = node.name || node.address || t("nodes.thisNode");
-			setServiceActionConfirm({ type: "update", node, label });
-		},
-		[t],
-	);
+	const handleUpdateNodeService = useCallback((node: NodeType) => {
+		if (!node?.id) return;
+		setServiceUpdateTarget({ type: "node", node });
+	}, []);
+
+	const closeServiceUpdateDialog = () => {
+		if (updatingServiceNodeId !== null || updatingBulkService) return;
+		setServiceUpdateTarget(null);
+	};
+
+	const handleServiceUpdateSubmit = async (
+		channel: NodeServiceUpdateChannel,
+		version?: string,
+	) => {
+		if (!serviceUpdateTarget) return;
+		if (serviceUpdateTarget.type === "node") {
+			const node = serviceUpdateTarget.node;
+			if (!node.id) return;
+			setUpdatingServiceNodeId(node.id);
+			try {
+				await apiFetch(`/node/${node.id}/service/update`, {
+					method: "POST",
+					body: { channel, version },
+				});
+				generateSuccessMessage(t("nodes.updateServiceTriggered"), toast);
+				queryClient.invalidateQueries(FetchNodesQueryKey);
+				setServiceUpdateTarget(null);
+			} catch (err) {
+				generateErrorMessage(err, toast);
+			} finally {
+				setUpdatingServiceNodeId(null);
+			}
+			return;
+		}
+
+		const targetNodes = serviceUpdateTarget.nodes.filter(
+			(node) => node.id != null,
+		);
+		if (targetNodes.length === 0) return;
+		setUpdatingBulkService(true);
+		try {
+			await apiFetch("/nodes/service/update", {
+				method: "POST",
+				body: {
+					nodes: targetNodes.map((node) => ({ id: node.id, channel, version })),
+				},
+			});
+			generateSuccessMessage(
+				t("nodes.updateAllNodeServicesTriggered", {
+					count: targetNodes.length,
+				}),
+				toast,
+			);
+			queryClient.invalidateQueries(FetchNodesQueryKey);
+			setServiceUpdateTarget(null);
+		} catch (err) {
+			generateErrorMessage(err, toast);
+		} finally {
+			setUpdatingBulkService(false);
+		}
+	};
 
 	const handleRebootNodeHost = useCallback(
 		(node: NodeType) => {
@@ -1108,10 +1173,7 @@ export const NodesPage: FC = () => {
 			});
 			return;
 		}
-		setServiceActionConfirm({
-			type: "update-all",
-			count: targetNodes.length,
-		});
+		setServiceUpdateTarget({ type: "bulk", nodes: targetNodes });
 	};
 
 	const closeServiceActionConfirm = () => {
@@ -1721,6 +1783,10 @@ export const NodesPage: FC = () => {
 			});
 			return;
 		}
+		if (type === "bulk-update") {
+			setServiceUpdateTarget({ type: "bulk", nodes: nodesForAction });
+			return;
+		}
 		let hostImpact: NodeHostImpact | undefined;
 		if (type === "bulk-disable") {
 			try {
@@ -1901,6 +1967,27 @@ export const NodesPage: FC = () => {
 		hostCleanupLoading ||
 		updatingBulkService ||
 		Boolean(bulkNodeActionLoading);
+
+	const serviceUpdateDialogTitle =
+		serviceUpdateTarget?.type === "node"
+			? t("nodes.updateServiceDialog.nodeTitle", {
+					name: serviceUpdateTarget.node.name ?? t("nodes.unnamedNode"),
+				})
+			: t("nodes.updateServiceDialog.bulkTitle");
+	const serviceUpdateDialogDescription =
+		serviceUpdateTarget?.type === "node"
+			? t("nodes.updateServiceDialog.nodeDescription")
+			: t("nodes.updateServiceDialog.bulkDescription", {
+					count: serviceUpdateTarget?.nodes.length ?? 0,
+				});
+	const serviceUpdateCurrentChannel =
+		serviceUpdateTarget?.type === "node"
+			? getNodeUpdateChannel(serviceUpdateTarget.node, nodeUpdateChannel)
+			: nodeUpdateChannel;
+	const serviceUpdateCurrentVersion =
+		serviceUpdateTarget?.type === "node"
+			? getNodeRuntimeVersion(serviceUpdateTarget.node)
+			: undefined;
 
 	const versionDialogTitle =
 		versionDialogTarget?.type === "bulk"
@@ -2356,7 +2443,9 @@ export const NodesPage: FC = () => {
 				mobileVisible: true,
 				mobilePriority: 10,
 				mobileMetaLabel: t("nodes.protocols"),
-				cell: (node) => <ProtocolStatusList statuses={node.protocol_statuses} />,
+				cell: (node) => (
+					<ProtocolStatusList statuses={node.protocol_statuses} />
+				),
 			},
 			{
 				id: "certificate",
@@ -2414,22 +2503,75 @@ export const NodesPage: FC = () => {
 				<ProtocolStatusList statuses={node.protocol_statuses} />
 			</Box>
 			<SimpleGrid columns={{ base: 1, sm: 2, xl: 4 }} spacing={3}>
-				<NodeDetail label={t("nodes.nodeAddress")} value={`${node.address}:${node.port}`} />
-				<NodeDetail label={t("nodes.columns.nodeRuntime")} value={getNodeRuntimeDisplayVersion(node) || "-"} />
-				<NodeDetail label={t("nodes.installMode.label")} value={node.node_install_mode || "-"} />
-				<NodeDetail label={t("nodes.updateChannel")} value={node.node_update_channel || "-"} />
-				<NodeDetail label={t("nodes.xrayProcess")} value={node.xray_pid ? `PID ${node.xray_pid}` : "-"} />
-				<NodeDetail label={t("nodes.xrayCPU")} value={formatNodePercent(node.xray_cpu_usage_percent)} />
-				<NodeDetail label={t("nodes.xrayMemory")} value={formatNodeBytes(node.xray_memory_used)} />
-				<NodeDetail label={t("nodes.xrayUptime")} value={formatNodeUptime(node.xray_uptime_seconds)} />
-				<NodeDetail label={t("nodes.cpu")} value={`${formatNodePercent(node.cpu_usage_percent)} · ${formatCPUFrequency(node.cpu_frequency_hz) || "-"}`} />
-				<NodeDetail label={t("nodes.ram")} value={`${formatNodeBytes(node.memory_used)} / ${formatNodeBytes(node.memory_total)}`} />
-				<NodeDetail label={t("nodes.bandwidthSpeed")} value={`↑ ${formatNodeSpeed(node.upload_speed)} · ↓ ${formatNodeSpeed(node.download_speed)}`} />
-				<NodeDetail label={t("redisUptime")} value={formatNodeUptime(node.uptime_seconds)} />
-				<NodeDetail label={t("nodes.revisions")} value={`${node.applied_revision ?? 0} / ${node.desired_revision ?? 0}`} />
-				<NodeDetail label={t("nodes.capabilities")} value={node.capabilities?.join(", ") || "-"} />
+				<NodeDetail
+					label={t("nodes.agentHealth")}
+					value={node.agent_status || "unknown"}
+				/>
+				<NodeDetail
+					label={t("nodes.xrayHealth")}
+					value={node.xray_status || "unknown"}
+				/>
+				<NodeDetail
+					label={t("nodes.nodeAddress")}
+					value={`${node.address}:${node.port}`}
+				/>
+				<NodeDetail
+					label={t("nodes.columns.nodeRuntime")}
+					value={getNodeRuntimeDisplayVersion(node) || "-"}
+				/>
+				<NodeDetail
+					label={t("nodes.installMode.label")}
+					value={node.node_install_mode || "-"}
+				/>
+				<NodeDetail
+					label={t("nodes.updateChannel")}
+					value={node.node_update_channel || "-"}
+				/>
+				<NodeDetail
+					label={t("nodes.xrayProcess")}
+					value={node.xray_pid ? `PID ${node.xray_pid}` : "-"}
+				/>
+				<NodeDetail
+					label={t("nodes.xrayCPU")}
+					value={formatNodePercent(node.xray_cpu_usage_percent)}
+				/>
+				<NodeDetail
+					label={t("nodes.xrayMemory")}
+					value={formatNodeBytes(node.xray_memory_used)}
+				/>
+				<NodeDetail
+					label={t("nodes.xrayUptime")}
+					value={formatNodeUptime(node.xray_uptime_seconds)}
+				/>
+				<NodeDetail
+					label={t("nodes.cpu")}
+					value={`${formatNodePercent(node.cpu_usage_percent)} · ${formatCPUFrequency(node.cpu_frequency_hz) || "-"}`}
+				/>
+				<NodeDetail
+					label={t("nodes.ram")}
+					value={`${formatNodeBytes(node.memory_used)} / ${formatNodeBytes(node.memory_total)}`}
+				/>
+				<NodeDetail
+					label={t("nodes.bandwidthSpeed")}
+					value={`↑ ${formatNodeSpeed(node.upload_speed)} · ↓ ${formatNodeSpeed(node.download_speed)}`}
+				/>
+				<NodeDetail
+					label={t("redisUptime")}
+					value={formatNodeUptime(node.uptime_seconds)}
+				/>
+				<NodeDetail
+					label={t("nodes.revisions")}
+					value={`${node.applied_revision ?? 0} / ${node.desired_revision ?? 0}`}
+				/>
+				<NodeDetail
+					label={t("nodes.capabilities")}
+					value={node.capabilities?.join(", ") || "-"}
+				/>
 				<NodeDetail label={t("nodes.note")} value={node.note || "-"} />
-				<NodeDetail label={t("nodes.lastMessage")} value={node.message || "-"} />
+				<NodeDetail
+					label={t("nodes.lastMessage")}
+					value={node.message || "-"}
+				/>
 			</SimpleGrid>
 		</Stack>
 	);
@@ -2625,11 +2767,7 @@ export const NodesPage: FC = () => {
 		) : null;
 
 	if (!getUserIsSuccess) {
-		return (
-			<VStack spacing={4} align="center" py={10}>
-				<Spinner size="lg" />
-			</VStack>
-		);
+		return <PageLoadingSkeleton />;
 	}
 
 	if (!canManageNodes) {
@@ -2643,6 +2781,10 @@ export const NodesPage: FC = () => {
 				</Text>
 			</VStack>
 		);
+	}
+
+	if (isLoading && !nodes) {
+		return <PageLoadingSkeleton />;
 	}
 
 	return (
@@ -2903,7 +3045,9 @@ export const NodesPage: FC = () => {
 				actionsColumnWidth="44px"
 				showActionsOnHover
 				onRowClick={(node) =>
-					setExpandedNodeID((current) => current === node.id ? null : (node.id ?? null))
+					setExpandedNodeID((current) =>
+						current === node.id ? null : (node.id ?? null),
+					)
 				}
 				isRowExpanded={(node) => expandedNodeID === node.id}
 				renderExpandedRow={renderExpandedNode}
@@ -3086,6 +3230,22 @@ export const NodesPage: FC = () => {
 				allowPersist={false}
 				isSubmitting={versionDialogLoading}
 			/>
+			<NodeServiceUpdateDialog
+				isOpen={Boolean(serviceUpdateTarget)}
+				onClose={closeServiceUpdateDialog}
+				onSubmit={handleServiceUpdateSubmit}
+				title={serviceUpdateDialogTitle}
+				description={serviceUpdateDialogDescription}
+				currentChannel={serviceUpdateCurrentChannel}
+				targetVersion={serviceUpdateCurrentVersion}
+				latestVersion={getLatestNodeVersionForChannel(
+					maintenanceInfo,
+					"latest",
+				)}
+				devVersion={getLatestNodeVersionForChannel(maintenanceInfo, "dev")}
+				catalog={buildCatalog}
+				isSubmitting={updatingServiceNodeId !== null || updatingBulkService}
+			/>
 			<GeoUpdateDialog
 				isOpen={Boolean(geoDialogTarget)}
 				onClose={closeGeoDialog}
@@ -3168,7 +3328,6 @@ export const NodesPage: FC = () => {
 				isOpen={!!editingNode}
 				onClose={() => setEditingNode(null)}
 				node={editingNode || undefined}
-				defaultInboundTags={defaultInboundSummaries}
 				mutate={updateNodeMutate}
 				isLoading={isUpdating}
 			/>

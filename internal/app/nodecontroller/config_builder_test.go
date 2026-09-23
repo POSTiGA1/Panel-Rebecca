@@ -156,10 +156,14 @@ func TestApplyRuntimeAPIEnablesOnlineUserStats(t *testing.T) {
 		encoded, _ := json.Marshal(level0)
 		t.Fatalf("runtime user stats policy is incomplete: %s", encoded)
 	}
+	system := mapValue(policy["system"])
+	if system["statsInboundUplink"] != true || system["statsInboundDownlink"] != true {
+		t.Fatalf("runtime inbound stats policy is incomplete: %#v", system)
+	}
 }
 
 func TestRemoteAccessProtocolsRequireFullUserSync(t *testing.T) {
-	for _, protocol := range []string{"openvpn", "l2tp", "pptp", "wireguard", "ikev2", "anyconnect"} {
+	for _, protocol := range []string{"openvpn", "l2tp", "pptp", "wireguard", "amneziawg", "ikev2", "anyconnect"} {
 		if !protocolRequiresFullUserSync(protocol) {
 			t.Fatalf("%s user changes must trigger a full runtime sync", protocol)
 		}
